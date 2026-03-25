@@ -29,6 +29,8 @@
 
 #include "colmap/feature/sift.h"
 
+#include "colmap/feature/sift_internal.h"
+#include "colmap/feature/sift_mlx.h"
 #include "colmap/feature/utils.h"
 #include "colmap/math/math.h"
 #include "colmap/util/cuda.h"
@@ -59,10 +61,8 @@
 
 namespace colmap {
 
-constexpr int kSiftDescriptorDim = 128;
-
-// SIFT descriptors are normalized to length 512 (w/ quantization errors).
-constexpr int kSqSiftDescriptorNorm = 512 * 512;
+using internal::kSiftDescriptorDim;
+using internal::kSqSiftDescriptorNorm;
 
 bool SiftExtractionOptions::Check() const {
   CHECK_OPTION_GT(max_num_features, 0);
@@ -85,7 +85,7 @@ bool SiftMatchingOptions::Check() const {
   return true;
 }
 
-namespace {
+namespace internal {
 
 void WarnDarknessAdaptivityNotAvailable() {
   LOG(WARNING) << "Darkness adaptivity only available for GLSL SiftGPU.";
@@ -93,7 +93,7 @@ void WarnDarknessAdaptivityNotAvailable() {
 
 void ThrowCheckFeatureTypesMatch(const FeatureMatcher::Image& image1,
                                  const FeatureMatcher::Image& image2,
-                                 bool check_keypoints = false) {
+                                 bool check_keypoints) {
   THROW_CHECK_NOTNULL(image1.descriptors);
   THROW_CHECK_NOTNULL(image2.descriptors);
   THROW_CHECK_EQ(image1.descriptors->type, FeatureExtractorType::SIFT);
@@ -740,7 +740,7 @@ class SiftGPUFeatureExtractor : public FeatureExtractor {
 };
 #endif  // COLMAP_GPU_ENABLED
 
-}  // namespace
+}  // namespace internal
 
 std::unique_ptr<FeatureExtractor> CreateSiftFeatureExtractor(
     const FeatureExtractionOptions& options) {
@@ -748,21 +748,21 @@ std::unique_ptr<FeatureExtractor> CreateSiftFeatureExtractor(
       options.sift->domain_size_pooling ||
       options.sift->force_covariant_extractor) {
     LOG(INFO) << "Creating Covariant SIFT CPU feature extractor";
-    return CovariantSiftCPUFeatureExtractor::Create(options);
+    return internal::CovariantSiftCPUFeatureExtractor::Create(options);
   } else if (options.use_gpu) {
 #if defined(COLMAP_GPU_ENABLED)
     LOG(INFO) << "Creating SIFT GPU feature extractor";
-    return SiftGPUFeatureExtractor::Create(options);
+    return internal::SiftGPUFeatureExtractor::Create(options);
 #else
     return nullptr;
 #endif  // COLMAP_GPU_ENABLED
   } else {
     LOG(INFO) << "Creating SIFT CPU feature extractor";
-    return SiftCPUFeatureExtractor::Create(options);
+    return internal::SiftCPUFeatureExtractor::Create(options);
   }
 }
 
-namespace {
+namespace internal {
 
 size_t FindBestMatchesOneWayBruteForce(
     const Eigen::RowMajorMatrixXf& dot_products,
@@ -947,11 +947,6 @@ void FindBestMatchesIndex(const Eigen::RowMajorMatrixXi& indices_1to2,
     }
   }
 }
-
-enum class DistanceType {
-  L2,
-  DOT_PRODUCT,
-};
 
 Eigen::RowMajorMatrixXf ComputeSiftDistanceMatrix(
     const DistanceType distance_type,
@@ -1543,7 +1538,7 @@ class SiftGPUFeatureMatcher : public FeatureMatcher {
 };
 #endif  // COLMAP_GPU_ENABLED
 
-}  // namespace
+}  // namespace internal
 
 std::unique_ptr<FeatureMatcher> CreateSiftFeatureMatcher(
     const FeatureMatchingOptions& options) {
@@ -1552,15 +1547,17 @@ std::unique_ptr<FeatureMatcher> CreateSiftFeatureMatcher(
     return CreateLightGlueONNXFeatureMatcher(options, options.sift->lightglue);
   } else if (options.type == FeatureMatcherType::SIFT_BRUTEFORCE) {
     if (options.use_gpu) {
-#ifdef COLMAP_GPU_ENABLED
+#if defined(COLMAP_GPU_ENABLED)
       LOG(INFO) << "Creating SIFT GPU feature matcher";
-      return SiftGPUFeatureMatcher::Create(options);
+      return internal::SiftGPUFeatureMatcher::Create(options);
+#elif defined(COLMAP_MLX_ENABLED)
+      return CreateSiftMLXFeatureMatcher(options);
 #else
       return nullptr;
-#endif  // COLMAP_GPU_ENABLED
+#endif
     } else {
       LOG(INFO) << "Creating SIFT CPU feature matcher";
-      return SiftCPUFeatureMatcher::Create(options);
+      return internal::SiftCPUFeatureMatcher::Create(options);
     }
   } else {
     LOG(FATAL_THROW) << "Unknown SIFT feature matcher type: "

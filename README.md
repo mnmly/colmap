@@ -30,6 +30,25 @@ Download
   CUDA-enabled wheels are available at https://pypi.org/project/pycolmap-cuda12.
 * To **build from source**, please see https://colmap.github.io/install.html.
 
+MLX Support (Apple Silicon)
+--------------------------
+
+This fork adds optional [MLX](https://github.com/ml-explore/mlx) support for
+GPU-accelerated SIFT feature matching on Apple Silicon. When enabled, the
+descriptor dot-product computation is offloaded to the Metal GPU via MLX's
+optimized `matmul`, providing significant speedups over CPU-only matching.
+
+**Requirements:** MLX installed and discoverable via `find_package(MLX)`.
+
+**Build:**
+
+    cmake .. -DMLX_ENABLED=ON
+    # or, if MLX is in a custom location:
+    cmake .. -DMLX_ENABLED=ON -DCMAKE_PREFIX_PATH=/path/to/mlx/install
+
+**Usage:** Run feature matching with `--SiftMatching.use_gpu 1`. On Apple Silicon
+without CUDA, the MLX backend is selected automatically.
+
 Getting Started
 ---------------
 

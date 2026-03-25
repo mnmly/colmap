@@ -55,6 +55,8 @@ COLMAP_ADD_LIBRARY(
         onnx_matchers.h onnx_matchers.cc
         onnx_utils.h onnx_utils.cc
         sift.h sift.cc
+        sift_internal.h
+        sift_mlx.h sift_mlx.cc
         types.h types.cc
         utils.h utils.cc
     PUBLIC_LINK_LIBS
@@ -83,6 +85,10 @@ endif()
 
 if(ONNX_ENABLED)
     target_link_libraries(colmap_feature PRIVATE onnxruntime::onnxruntime)
+endif()
+
+if(MLX_ENABLED)
+    target_link_libraries(colmap_feature PRIVATE mlx)
 endif()
 
 if(ONNX_ENABLED)
