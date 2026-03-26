@@ -137,3 +137,19 @@ COLMAP_ADD_TEST(
 if(TESTS_ENABLED AND GUI_ENABLED)
     target_link_libraries(colmap_feature_sift_test Qt${QT_VERSION_MAJOR}::Widgets)
 endif()
+
+if(MLX_ENABLED)
+    add_executable(colmap_sift_mlx_bench sift_mlx_bench.cc)
+    target_link_libraries(colmap_sift_mlx_bench
+        PRIVATE colmap_feature colmap_util mlx)
+    if(GUI_ENABLED)
+        target_link_libraries(colmap_sift_mlx_bench PRIVATE
+            Qt${QT_VERSION_MAJOR}::Widgets)
+    endif()
+
+    add_executable(colmap_sift_mlx_image_test sift_mlx_image_test.cc)
+    target_link_libraries(colmap_sift_mlx_image_test
+        PRIVATE colmap_feature colmap_util mlx)
+    target_compile_definitions(colmap_sift_mlx_image_test
+        PRIVATE ${COLMAP_COMPILE_DEFINITIONS})
+endif()

@@ -34,20 +34,41 @@ MLX Support (Apple Silicon)
 --------------------------
 
 This fork adds optional [MLX](https://github.com/ml-explore/mlx) support for
-GPU-accelerated SIFT feature matching on Apple Silicon. When enabled, the
-descriptor dot-product computation is offloaded to the Metal GPU via MLX's
-optimized `matmul`, providing significant speedups over CPU-only matching.
+GPU-accelerated SIFT feature matching on Apple Silicon. A custom Metal kernel
+fuses the descriptor dot-product, SIMD shuffle-down top-2 reduction, and ratio
+test in a single GPU pass — no N×M matrix is ever allocated or transferred back.
 
-**Requirements:** MLX installed and discoverable via `find_package(MLX)`.
+Verified **~186× faster** than CPU brute-force on real images (6K–10K keypoints
+per image, 120 pairs), with bit-identical match sets.
 
-**Build:**
+**Requirements:**
 
-    cmake .. -DMLX_ENABLED=ON
-    # or, if MLX is in a custom location:
-    cmake .. -DMLX_ENABLED=ON -DCMAKE_PREFIX_PATH=/path/to/mlx/install
+- macOS 14+ (Metal 3.1+, required for `bfloat` in JIT-compiled kernels)
+- [MLX](https://github.com/ml-explore/mlx) built from source and installed
 
-**Usage:** Run feature matching with `--SiftMatching.use_gpu 1`. On Apple Silicon
-without CUDA, the MLX backend is selected automatically.
+**Build MLX from source:**
+
+    git clone https://github.com/ml-explore/mlx.git
+    cmake -B mlx/build mlx -DCMAKE_BUILD_TYPE=Release
+    cmake --build mlx/build -j$(sysctl -n hw.logicalcpu)
+    sudo cmake --install mlx/build --prefix /usr/local
+
+**Build COLMAP with MLX:**
+
+    mkdir build && cd build
+    cmake .. -G Ninja -DMLX_ENABLED=ON
+    # if MLX is installed to a custom prefix:
+    # cmake .. -G Ninja -DMLX_ENABLED=ON -DCMAKE_PREFIX_PATH=/path/to/mlx/install
+    ninja
+
+**Usage:** Pass `--SiftMatching.use_gpu 1`. On Apple Silicon without CUDA, the
+MLX backend is selected automatically when `MLX_ENABLED=ON`.
+
+**Tools (built with MLX):**
+
+- `colmap_sift_mlx_bench` — benchmark MLX vs CPU vs OpenGL across feature counts
+- `colmap_sift_mlx_image_test <dir>` — run all image pairs through both CPU and
+  MLX matchers and verify identical results; reports per-pair counts and speedup
 
 Getting Started
 ---------------

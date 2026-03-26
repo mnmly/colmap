@@ -50,21 +50,137 @@ namespace {
 // are not explicitly thread-safe for concurrent submissions.
 std::mutex mlx_matcher_mutex;
 
-mx::array EigenUint8ToMLXFloat(const FeatureDescriptorsData& descriptors) {
-  const int num_descriptors = static_cast<int>(descriptors.rows());
-  const int dim = static_cast<int>(descriptors.cols());
-
-  // Create MLX array from raw pointer (zero-copy for the uint8 data).
-  // The no-op deleter means the Eigen matrix must outlive this array
-  // until eval() is called.
-  auto mlx_uint8 = mx::array(
+// Zero-copy uint8 view of a descriptor matrix, valid until `descriptors`
+// is destroyed.  eval() must be called before `descriptors` goes out of scope.
+mx::array EigenUint8ToMLXUint8(const FeatureDescriptorsData& descriptors) {
+  const int rows = static_cast<int>(descriptors.rows());
+  const int cols = static_cast<int>(descriptors.cols());
+  return mx::array(
       const_cast<void*>(static_cast<const void*>(descriptors.data())),
-      {num_descriptors, dim},
+      {rows, cols},
       mx::uint8,
       [](void*) {});
+}
 
-  // Cast to float32 for matmul. This triggers a copy to GPU.
-  return mx::astype(mlx_uint8, mx::float32);
+// ---------------------------------------------------------------------------
+// Custom Metal kernel: fused SIFT one-way matching (v3)
+//
+// One SIMD group (32 threads) per query descriptor.
+//   - Each lane j streams through M/32 reference descriptors in strides of 32,
+//     computing the dot product on the fly and maintaining a per-lane top-2.
+//   - A SIMD shuffle-down tree reduces the 32 lanes into the global top-2
+//     for that query without any threadgroup (shared) memory.
+//   - Ratio test + angular distance filter run entirely on-chip.
+//   - Only a (N,) int32 result array is written back — the N×M float
+//     matrix is never allocated.
+//
+// Grid: (N*32, 1, 1) total threads → N threadgroups of 32 threads.
+// MLX auto-generates the kernel signature from input/output array types and
+// adds Metal attributes that appear in the source (threadgroup_position_in_grid,
+// thread_index_in_threadgroup).
+// ---------------------------------------------------------------------------
+
+// clang-format off
+static const char* kMatchKernelHeader = R"(
+#include <metal_stdlib>
+using namespace metal;
+)";
+
+static const char* kMatchKernelBody = R"(
+  constexpr uint kT = 32u;                        // SIMD group width
+
+  uint i = threadgroup_position_in_grid.x;    // query index 0..N-1
+  uint t = thread_index_in_threadgroup;       // SIMD lane 0..31 (scalar uint)
+
+  uint N = (uint)desc1_shape[0];
+  uint M = (uint)desc2_shape[0];
+
+  if (i >= N) return;
+
+  const device uint8_t* q = desc1 + i * 128u;    // query descriptor row
+
+  // Per-lane running top-2 over the candidates this lane is responsible for.
+  float lane_best   = 0.0f;
+  float lane_second = 0.0f;
+  int   lane_idx    = -1;
+
+  for (uint j = t; j < M; j += kT) {
+    const device uint8_t* r = desc2 + j * 128u;
+    float dot = 0.0f;
+    for (uint d = 0; d < 128u; d++) {
+      dot = fma(float(q[d]), float(r[d]), dot);
+    }
+    if (dot > lane_best) {
+      lane_second = lane_best;
+      lane_best   = dot;
+      lane_idx    = (int)j;
+    } else if (dot > lane_second) {
+      lane_second = dot;
+    }
+  }
+
+  // SIMD tree-reduction: merge 32 per-lane (best, second, idx) into one.
+  // At each step the winner keeps its best and promotes the loser's best
+  // as the new second if it beats the current second.
+  for (uint stride = kT >> 1u; stride >= 1u; stride >>= 1u) {
+    float o_best   = simd_shuffle_down(lane_best,   stride);
+    float o_second = simd_shuffle_down(lane_second, stride);
+    int   o_idx    = simd_shuffle_down(lane_idx,    stride);
+    if (o_best > lane_best) {
+      lane_second = max(lane_best,   o_second);
+      lane_best   = o_best;
+      lane_idx    = o_idx;
+    } else {
+      lane_second = max(lane_second, o_best);
+    }
+  }
+
+  // Lane 0 holds the correct global top-2; apply ratio test and write output.
+  if (t == 0u) {
+    constexpr float kInvNorm = 1.0f / 262144.0f;  // 1 / (512*512)
+    float da = acos(fmin(lane_best   * kInvNorm, 1.0f));
+    float db = acos(fmin(lane_second * kInvNorm, 1.0f));
+    matches[i] = (lane_idx >= 0 && da <= max_distance && da < max_ratio * db)
+                     ? lane_idx : -1;
+  }
+)";
+// clang-format on
+
+// Returns the singleton CustomKernelFunction, compiled once on first use.
+// MLX caches the resulting MTLLibrary by kernel name.
+const mx::fast::CustomKernelFunction& SiftMatchKernel() {
+  static const auto kKernel = mx::fast::metal_kernel(
+      "sift_match_one_way",
+      {"desc1", "desc2", "max_ratio", "max_distance"},
+      {"matches"},
+      kMatchKernelBody,
+      kMatchKernelHeader);
+  return kKernel;
+}
+
+// Dispatches the custom kernel for one matching direction.
+// desc1: (N, 128) uint8 — queries
+// desc2: (M, 128) uint8 — references
+// Returns (N,) int32: best match index in [0, M) or -1 if none.
+mx::array MatchOneWayCustomKernel(const mx::array& desc1,
+                                  const mx::array& desc2,
+                                  float max_ratio,
+                                  float max_distance) {
+  const int N = desc1.shape(0);
+  constexpr int kSimdWidth = 32;
+  mx::Shape out_shape = {N};
+  // std::function doesn't forward default args — all 9 params are required.
+  auto results = SiftMatchKernel()(
+      {desc1, desc2, mx::array(max_ratio), mx::array(max_distance)},
+      std::vector<mx::Shape>{out_shape},
+      std::vector<mx::Dtype>{mx::int32},
+      std::make_tuple(N * kSimdWidth, 1, 1),  // total threads: N groups × 32
+      std::make_tuple(kSimdWidth, 1, 1),       // threadgroup size
+      {},             // template_args (none)
+      std::nullopt,   // init_value
+      false,          // verbose
+      {});            // default stream/device
+  return results[0];
 }
 
 }  // namespace
@@ -94,33 +210,56 @@ class SiftMLXFeatureMatcher : public FeatureMatcher {
       return;
     }
 
-    Eigen::RowMajorMatrixXf dot_products;
+    const int N = static_cast<int>(image1.descriptors->data.rows());
+    const int M = static_cast<int>(image2.descriptors->data.rows());
+    const float max_ratio = static_cast<float>(options_.sift->max_ratio);
+    const float max_distance = static_cast<float>(options_.sift->max_distance);
+    const bool cross_check = options_.sift->cross_check;
+
+    mx::array matches_1to2 = mx::array(0);
+    mx::array matches_2to1 = mx::array(0);
 
     {
       std::lock_guard<std::mutex> lock(mlx_matcher_mutex);
 
-      auto desc1 = EigenUint8ToMLXFloat(image1.descriptors->data);
-      auto desc2 = EigenUint8ToMLXFloat(image2.descriptors->data);
+      // Zero-copy uint8 views — the Eigen matrices outlive this scope.
+      auto desc1 = EigenUint8ToMLXUint8(image1.descriptors->data);
+      auto desc2 = EigenUint8ToMLXUint8(image2.descriptors->data);
 
-      // Compute pairwise dot products on Metal GPU:
-      // dot_products[i][j] = desc1[i] . desc2[j]
-      auto dots = mx::matmul(desc1, mx::transpose(desc2));
-      mx::eval(dots);
-
-      // Map result back to Eigen matrix.
-      const int rows = static_cast<int>(image1.descriptors->data.rows());
-      const int cols = static_cast<int>(image2.descriptors->data.rows());
-      dot_products.resize(rows, cols);
-      const float* data_ptr = dots.data<float>();
-      std::copy(data_ptr, data_ptr + rows * cols, dot_products.data());
+      // Fused top-2 + ratio test entirely on Metal GPU.
+      // Only (N,) and optionally (M,) int32 arrays are transferred back.
+      matches_1to2 =
+          MatchOneWayCustomKernel(desc1, desc2, max_ratio, max_distance);
+      if (cross_check) {
+        matches_2to1 =
+            MatchOneWayCustomKernel(desc2, desc1, max_ratio, max_distance);
+        mx::eval(matches_1to2, matches_2to1);
+      } else {
+        mx::eval(matches_1to2);
+      }
     }
 
-    // Reuse existing CPU brute-force matching (ratio test + cross-check).
-    internal::FindBestMatchesBruteForce(dot_products,
-                                        options_.sift->max_ratio,
-                                        options_.sift->max_distance,
-                                        options_.sift->cross_check,
-                                        matches);
+    // O(N) CPU scan to collect (mutual) matches.
+    const int32_t* m12 = matches_1to2.data<int32_t>();
+
+    if (cross_check) {
+      const int32_t* m21 = matches_2to1.data<int32_t>();
+      for (int i = 0; i < N; ++i) {
+        const int j = m12[i];
+        if (j >= 0 && j < M && m21[j] == static_cast<int32_t>(i)) {
+          matches->push_back(
+              {static_cast<point2D_t>(i), static_cast<point2D_t>(j)});
+        }
+      }
+    } else {
+      for (int i = 0; i < N; ++i) {
+        const int j = m12[i];
+        if (j >= 0) {
+          matches->push_back(
+              {static_cast<point2D_t>(i), static_cast<point2D_t>(j)});
+        }
+      }
+    }
   }
 
   void MatchGuided(const double max_error,

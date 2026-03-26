@@ -36,6 +36,7 @@
 #endif
 
 #include "colmap/feature/sift.h"
+#include "colmap/feature/sift_mlx.h"
 #include "colmap/feature/utils.h"
 #include "colmap/geometry/essential_matrix.h"
 #include "colmap/math/random.h"
@@ -979,6 +980,111 @@ TEST(MatchGuidedSiftFeaturesGPU, EssentialMatrix) {
         });
   });
 }
+
+#if defined(COLMAP_MLX_ENABLED)
+
+// Compares MLX custom-kernel Match() output against CPU brute-force on
+// controlled inputs to verify correctness of the SIMD streaming top-2 kernel.
+TEST(SiftMLXFeatureMatcherVsCPU, Nominal) {
+  const Camera camera = Camera::CreateFromModelId(
+      1, CameraModelId::kSimplePinhole, 100.0, 100, 200);
+
+  auto MakeImage = [&](image_t id,
+                       std::shared_ptr<FeatureDescriptors> desc)
+      -> FeatureMatcher::Image {
+    return {id, &camera, /*keypoints=*/nullptr, std::move(desc)};
+  };
+
+  // Helper: run both matchers on (img1, img2) and assert identical results.
+  auto TestMLXvsBF =
+      [&](const FeatureMatchingOptions& options,
+          const FeatureMatcher::Image& img1,
+          const FeatureMatcher::Image& img2) -> size_t {
+    FeatureMatchingOptions bf_opts = options;
+    bf_opts.use_gpu = false;
+    bf_opts.sift->cpu_brute_force_matcher = true;
+    auto bf_matcher = CreateSiftFeatureMatcher(bf_opts);
+    EXPECT_NE(bf_matcher, nullptr);
+
+    auto mlx_matcher = CreateSiftMLXFeatureMatcher(options);
+    EXPECT_NE(mlx_matcher, nullptr);
+
+    FeatureMatches matches_bf, matches_mlx;
+    bf_matcher->Match(img1, img2, &matches_bf);
+    mlx_matcher->Match(img1, img2, &matches_mlx);
+    CheckEqualMatches(matches_bf, matches_mlx);
+    return matches_bf.size();
+  };
+
+  // --- Edge cases ---
+
+  const auto empty_desc =
+      std::make_shared<FeatureDescriptors>(CreateEmptyDescriptors());
+  const auto rand_desc_2 =
+      std::make_shared<FeatureDescriptors>(CreateRandomFeatureDescriptors(2));
+
+  FeatureMatchingOptions default_opts(FeatureMatcherType::SIFT_BRUTEFORCE);
+
+  // Both empty
+  TestMLXvsBF(default_opts, MakeImage(0, empty_desc), MakeImage(1, empty_desc));
+  // One empty
+  TestMLXvsBF(default_opts, MakeImage(0, empty_desc), MakeImage(1, rand_desc_2));
+  TestMLXvsBF(default_opts, MakeImage(0, rand_desc_2), MakeImage(1, empty_desc));
+
+  // --- Known-match pair (colwise-reversed): expect 2 mutual matches ---
+  {
+    const auto desc1 =
+        std::make_shared<FeatureDescriptors>(CreateRandomFeatureDescriptors(2));
+    FeatureDescriptors desc2_data;
+    desc2_data.data = desc1->data.colwise().reverse();
+    desc2_data.type = desc1->type;
+    const auto desc2 = std::make_shared<FeatureDescriptors>(desc2_data);
+
+    FeatureMatchingOptions opts(FeatureMatcherType::SIFT_BRUTEFORCE);
+    const size_t n = TestMLXvsBF(opts, MakeImage(0, desc1), MakeImage(1, desc2));
+    EXPECT_EQ(n, 2);
+  }
+
+  // --- Random 50-vs-50: both cross_check=true and false ---
+  {
+    const auto desc1 =
+        std::make_shared<FeatureDescriptors>(CreateRandomFeatureDescriptors(50));
+    const auto desc2 =
+        std::make_shared<FeatureDescriptors>(CreateRandomFeatureDescriptors(50));
+
+    FeatureMatchingOptions opts(FeatureMatcherType::SIFT_BRUTEFORCE);
+    opts.sift->cross_check = false;
+    TestMLXvsBF(opts, MakeImage(0, desc1), MakeImage(1, desc2));
+
+    opts.sift->cross_check = true;
+    TestMLXvsBF(opts, MakeImage(0, desc1), MakeImage(1, desc2));
+  }
+
+  // --- Identical descriptors (self-match): all 50 should match ---
+  {
+    const auto desc1 =
+        std::make_shared<FeatureDescriptors>(CreateRandomFeatureDescriptors(50));
+
+    FeatureMatchingOptions opts(FeatureMatcherType::SIFT_BRUTEFORCE);
+    const size_t n =
+        TestMLXvsBF(opts, MakeImage(0, desc1), MakeImage(1, desc1));
+    EXPECT_EQ(n, 50);
+  }
+
+  // --- Random 500-vs-500 ---
+  {
+    const auto desc1 = std::make_shared<FeatureDescriptors>(
+        CreateRandomFeatureDescriptors(500));
+    const auto desc2 = std::make_shared<FeatureDescriptors>(
+        CreateRandomFeatureDescriptors(500));
+
+    FeatureMatchingOptions opts(FeatureMatcherType::SIFT_BRUTEFORCE);
+    opts.sift->cross_check = true;
+    TestMLXvsBF(opts, MakeImage(0, desc1), MakeImage(1, desc2));
+  }
+}
+
+#endif  // COLMAP_MLX_ENABLED
 
 }  // namespace
 }  // namespace colmap
